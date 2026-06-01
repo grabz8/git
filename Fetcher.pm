@@ -269,10 +269,17 @@ out:
 sub change_dir_prop {
 	my ($self, $db, $prop, $value) = @_;
 	return undef if $self->is_path_ignored($db->{path});
+	
+	# Cache the properties safely in a temporary list array to evaluate during the finalize cycle
+	if ($prop eq 'svn:externals' && defined $value) {
+		push @{$self->{_pending_externals}}, { path => $db->{path}, value => $value };
+	}
+
 	$self->{dir_prop}->{$db->{path}} ||= {};
 	$self->{dir_prop}->{$db->{path}}->{$prop} = $value;
 	undef;
 }
+
 
 sub absent_directory {
 	my ($self, $path, $pb) = @_;
@@ -436,6 +443,72 @@ sub abort_edit {
 sub close_edit {
 	my $self = shift;
 
+	# --- START CORE STRUCTURAL LINK BINDING ---
+	if (defined $self->{_pending_externals} && $self->{gii}) {
+		use IPC::Open2;
+		eval {
+			# Safely extract the active base tracking URL out of the configuration layout registry
+			my $base_url = '';
+			if ($repo_id) {
+				$base_url = eval { command_oneline('config', '--get', "svn-remote.$repo_id.url") };
+			}
+
+			if ($base_url) {
+				foreach my $ext (@{$self->{_pending_externals}}) {
+					my $current_svn_dir = $ext->{path};
+					my $gpath = $self->git_path($current_svn_dir);
+					
+					foreach my $line (split(/\r?\n/, $ext->{value})) {
+						next if $line =~ /^\s*$/ || $line =~ /^\s*#/;
+						
+						my ($p1, $p2) = split(/\s+/, $line);
+						my ($local_target_dir, $ext_url) = ($p1 =~ m{^(https?://|\^/)}) ? ($p2, $p1) : ($p1, $p2);
+						
+						if ($ext_url =~ /^\^\/(.*)/) {
+							$ext_url = $base_url . "/" . $1;
+						}
+						
+						# Core Validation: Confirm target matches our exact repo and branch layout context
+						if ($ext_url =~ m{^\Q$base_url\E/(.*)}) {
+							my $internal_svn_source_path = $1;
+							my $link_placement = $gpath ? "$gpath/$local_target_dir" : $local_target_dir;
+							
+							my $current_depth = () = $link_placement =~ m{/}g;
+							my $relative_prefix = $current_depth > 0 ? ("../" x $current_depth) : "./";
+							my $symlink_target_content = $relative_prefix . $internal_svn_source_path;
+							
+							# 1. Generate a true tracked hash-object blob natively inside Git's database
+							my ($ho_out, $ho_in);
+							my $ho_pid = open2($ho_out, $ho_in, 'git', 'hash-object', '-w', '--stdin');
+							print $ho_in $symlink_target_content;
+							close($ho_in);
+							my $link_sha = <$ho_out>;
+							close($ho_out);
+							waitpid($ho_pid, 0);
+							chomp($link_sha);
+							
+							if ($link_sha =~ /^[0-9a-f]{40,64}$/) {
+								# 2. KEY TRANSITION: Update the internal IndexInfo object pipeline directly
+								# This permanently writes mode 120000 into the definitive Git commit tree object metadata!
+								$self->{gii}->update("120000", $link_sha, $link_placement);
+								
+								# 3. Force structural tracking bypass so Git doesn't try to lock placeholder loops
+								delete $self->{empty}->{$current_svn_dir} if exists $self->{empty}->{$current_svn_dir};
+								
+								print STDOUT "\tNatively committed directory link: $link_placement -> $symlink_target_content\n" unless $::_q;
+							}
+						}
+					}
+				}
+			}
+		};
+		if ($@) {
+			print STDERR "Warning: External directory link finalize cycle encountered an error: $@\n";
+		}
+		delete $self->{_pending_externals};
+	}
+	# --- END CORE STRUCTURAL LINK BINDING ---
+
 	if ($_preserve_empty_dirs) {
 		my @empty_dirs;
 
@@ -460,6 +533,7 @@ sub close_edit {
 	delete $self->{gii};
 	$self->SUPER::close_edit(@_);
 }
+
 
 sub find_empty_directories {
 	my ($self) = @_;
