@@ -443,88 +443,174 @@ sub abort_edit {
 sub close_edit {
 	my $self = shift;
 
-	# --- START CORE STRUCTURAL LINK BINDING ---
+	# --- START FINAL PRODUCTION STRUCTURAL LINK BINDING ---
 	if (defined $self->{_pending_externals} && $self->{gii}) {
 		use IPC::Open2;
 		eval {
-			# Safely extract the active base tracking URL out of the configuration layout registry
-			my $base_url = '';
-			if ($repo_id) {
-				$base_url = eval { command_oneline('config', '--get', "svn-remote.$repo_id.url") };
-			}
+			my $debug_active = $ENV{GIT_SVN_EXT_DEBUG} ? 1 : 0;
 
-			if ($base_url) {
+			if ($debug_active) {
+				print STDERR "\n=== [GIT-SVN LINK DEBUG] START FINALIZE CYCLE ===\n";
+			}
+			
+			# 1. Retrieve the absolute root URL of the entire SVN server repository
+			my $repo_root_url = '';
+			if ($repo_id) {
+				$repo_root_url = eval { command_oneline('config', '--get', "svn-remote.$repo_id.reposRoot") } ||
+				                 eval { command_oneline('config', '--get', "svn-remote.$repo_id.url") };
+			}
+			$repo_root_url =~ s/\/$// if $repo_root_url;
+
+			if ($repo_root_url) {
 				foreach my $ext (@{$self->{_pending_externals}}) {
 					my $current_svn_dir = $ext->{path};
 					my $gpath = $self->git_path($current_svn_dir);
 					
+					# 2. ISOLATION ENGINE: Dynamically extract the active SVN branch string layout prefix context
+					# Matches: "trunk", "branches/name", "tags/name", or "somefolder" from raw paths.
+					my $active_branch_path = '';
+					if ($current_svn_dir =~ m{^(trunk|somefolder)(?:/|$)}) {
+						$active_branch_path = $1;
+					} elsif ($current_svn_dir =~ m{^(branches/[^/]+|tags/[^/]+)(?:/|$)}) {
+						$active_branch_path = $1;
+					}
+
+					# Standardize the absolute folder server URL context path string sequences
+					my $current_folder_url = $repo_root_url . "/" . $current_svn_dir;
+					$current_folder_url =~ s/\/$//;
+
+					if ($debug_active) {
+						print STDERR "\nDEBUG: Processing SVN folder: '$current_svn_dir' -> Git path equivalent: '$gpath'\n";
+						print STDERR "DEBUG: Identified Active Branch Context Prefix = '$active_branch_path'\n";
+						print STDERR "DEBUG: Folder absolute SVN URL context = '$current_folder_url'\n";
+					}
+
 					foreach my $line (split(/\r?\n/, $ext->{value})) {
 						next if $line =~ /^\s*$/ || $line =~ /^\s*#/;
+						$line =~ s/^\s+|\s+$//g;
 						
-						my ($p1, $p2) = split(/\s+/, $line);
-						my ($local_target_dir, $ext_url) = ($p1 =~ m{^(https?://|\^/)}) ? ($p2, $p1) : ($p1, $p2);
-						
-						if ($ext_url =~ /^\^\/(.*)/) {
-							$ext_url = $base_url . "/" . $1;
+						if ($debug_active) {
+							print STDERR "--------------------------------------------------\n";
+							print STDERR "DEBUG: Raw external entry line: '$line'\n";
 						}
 						
-						# Core Validation: Confirm target matches our exact repo and branch layout context
-						if ($ext_url =~ m{^\Q$base_url\E/(.*)}) {
-							my $internal_svn_source_path = $1;
-							my $link_placement = $gpath ? "$gpath/$local_target_dir" : $local_target_dir;
+						if ($line =~ /^(.*?)\s+([^\s]+)$/) {
+							my $ext_raw_url = $1;
+							my $local_target_dir = $2;
 							
-							my $current_depth = () = $link_placement =~ m{/}g;
-							my $relative_prefix = $current_depth > 0 ? ("../" x $current_depth) : "./";
-							my $symlink_target_content = $relative_prefix . $internal_svn_source_path;
+							$ext_raw_url =~ s/^-r\s*\d+\s+//;
 							
-							# 1. Generate a true tracked hash-object blob natively inside Git's database
-							my ($ho_out, $ho_in);
-							my $ho_pid = open2($ho_out, $ho_in, 'git', 'hash-object', '-w', '--stdin');
-							print $ho_in $symlink_target_content;
-							close($ho_in);
-							my $link_sha = <$ho_out>;
-							close($ho_out);
-							waitpid($ho_pid, 0);
-							chomp($link_sha);
+							my $resolved_abs_url = '';
+
+							# 3. EXPAND RAW STRINGS TO ABSOLUTE PATH STRINGS
+							if ($ext_raw_url =~ /^\^\/(.*)/) {
+								$resolved_abs_url = $repo_root_url . "/" . $1;
+							} elsif ($ext_raw_url =~ m{^(https?://|file://)}) {
+								$resolved_abs_url = $ext_raw_url;
+							} elsif ($ext_raw_url =~ /^\.\.\/(.*)/) {
+								my @url_parts = split(/\//, $current_folder_url);
+								my $rel_path = $ext_raw_url;
+								while ($rel_path =~ s/^\.\.\///) {
+									pop @url_parts;
+								}
+								$resolved_abs_url = join('/', @url_parts) . "/" . $rel_path;
+							} else {
+								$resolved_abs_url = $current_folder_url . "/" . $ext_raw_url;
+							}
 							
-							if ($link_sha =~ /^[0-9a-f]{40,64}$/) {
-								# 2. KEY TRANSITION: Update the internal IndexInfo object pipeline directly
-								# This permanently writes mode 120000 into the definitive Git commit tree object metadata!
-								$self->{gii}->update("120000", $link_sha, $link_placement);
+							$resolved_abs_url =~ s/\/$//;
+
+							# 4. RESOLVE PURE INTRINSIC SERVER ROOT SNIPPET PATHS
+							if ($resolved_abs_url =~ m{^\Q$repo_root_url\E/(.*)}) {
+								my $target_inner_svn_path = $1; # e.g., "trunk/Media" or "branches/name/Media"
 								
-								# 3. Force structural tracking bypass so Git doesn't try to lock placeholder loops
-								delete $self->{empty}->{$current_svn_dir} if exists $self->{empty}->{$current_svn_dir};
-								
-								print STDOUT "\tNatively committed directory link: $link_placement -> $symlink_target_content\n" unless $::_q;
+								# Extract target destination branch context prefix properties
+								my $target_branch_path = '';
+								if ($target_inner_svn_path =~ m{^(trunk|somefolder)(?:/|$)}) {
+									$target_branch_path = $1;
+								} elsif ($target_inner_svn_path =~ m{^(branches/[^/]+|tags/[^/]+)(?:/|$)}) {
+									$target_branch_path = $1;
+								}
+
+								if ($debug_active) {
+									print STDERR "DEBUG: Checking internal branch match metrics:\n";
+									print STDERR "       Current context path branch = '$active_branch_path'\n";
+									print STDERR "       Target definition path branch = '$target_branch_path'\n";
+								}
+
+								# 5. CORE VALIDATION: Verify external stays inside current branch context boundaries
+								if ($active_branch_path ne '' && $active_branch_path eq $target_branch_path) {
+									
+									# Isolate target subpath details relative to the branch root folder area
+									my $internal_git_source_path = $target_inner_svn_path;
+									$internal_git_source_path =~ s/^\Q$active_branch_path\E\///; # e.g., "Media"
+
+									my $link_placement = $gpath ? "$gpath/$local_target_dir" : $local_target_dir;
+									
+									# 6. UNIFORM RELATIVE PATH PREFIX GENERATOR
+									my $current_depth = 0;
+									if ($gpath && $gpath ne '') {
+										my @directories = split(/\//, $gpath);
+										$current_depth = scalar @directories;
+									}
+									
+									my $relative_prefix = $current_depth > 0 ? ("../" x $current_depth) : "./";
+									my $symlink_target_content = $relative_prefix . $internal_git_source_path;
+									
+									if ($debug_active) {
+										print STDERR "DEBUG: MATCH SUCCESS! Inner branch path target = '$internal_git_source_path'\n";
+										print STDERR "DEBUG: Final calculated relative target string = '$symlink_target_content'\n";
+										print STDERR "DEBUG: Committing reference tree mapping      = '$link_placement' -> '$symlink_target_content'\n";
+									}
+
+									# 7. Stage and materialize link object data natively
+									my ($ho_out, $ho_in);
+									my $ho_pid = open2($ho_out, $ho_in, 'git', 'hash-object', '-w', '--stdin');
+									print $ho_in $symlink_target_content;
+									close($ho_in);
+									my $link_sha = <$ho_out>;
+									close($ho_out);
+									waitpid($ho_pid, 0);
+									chomp($link_sha);
+									
+									if ($link_sha =~ /^[0-9a-f]{40,64}$/) {
+										$self->{gii}->update("120000", $link_sha, $link_placement);
+										delete $self->{empty}->{$current_svn_dir} if exists $self->{empty}->{$current_svn_dir};
+										
+										if ($debug_active) {
+											system('git', 'checkout-index', '-f', $link_placement);
+										} else {
+											system('git', 'checkout-index', '-f', $link_placement, '2>/dev/null');
+										}
+										print STDOUT "\tNatively committed directory link: $link_placement -> $symlink_target_content\n" unless $::_q;
+									}
+								} else {
+									if ($debug_active) { print STDERR "DEBUG: MATCH FAILED! External path targets an out-of-branch location.\n"; }
+									print STDOUT "\tSkipping external: $ext_raw_url (Points outside active branch context)\n" unless $::_q;
+								}
 							}
 						}
 					}
 				}
 			}
+			if ($debug_active) {
+				print STDERR "=== [GIT-SVN LINK DEBUG] END FINALIZE CYCLE ===\n\n";
+			}
 		};
 		if ($@) {
-			print STDERR "Warning: External directory link finalize cycle encountered an error: $@\n";
+			print STDERR "Warning: External directory link mapping encountered an error: $@\n";
 		}
 		delete $self->{_pending_externals};
 	}
-	# --- END CORE STRUCTURAL LINK BINDING ---
+	# --- END FINAL PRODUCTION STRUCTURAL LINK BINDING ---
 
 	if ($_preserve_empty_dirs) {
 		my @empty_dirs;
-
-		# Any entry flagged as empty that also has an associated
-		# dir_prop represents a newly created empty directory.
 		foreach my $i (keys %{$self->{empty}}) {
 			push @empty_dirs, $i if exists $self->{dir_prop}->{$i};
 		}
-
-		# Search for directories that have become empty due subsequent
-		# file deletes.
 		push @empty_dirs, $self->find_empty_directories();
-
-		# Finally, add a placeholder file to each empty directory.
 		$self->add_placeholder_file($_) foreach (@empty_dirs);
-
 		$self->stash_placeholder_list();
 	}
 
