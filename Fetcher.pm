@@ -466,8 +466,7 @@ sub close_edit {
 					my $current_svn_dir = $ext->{path};
 					my $gpath = $self->git_path($current_svn_dir);
 					
-					# 2. ISOLATION ENGINE: Dynamically extract the active SVN branch string layout prefix context
-					# Matches: "trunk", "branches/name", "tags/name", or "somefolder" from raw paths.
+					# Determine the active branch layout context prefix string from the raw path
 					my $active_branch_path = '';
 					if ($current_svn_dir =~ m{^(trunk|somefolder)(?:/|$)}) {
 						$active_branch_path = $1;
@@ -475,24 +474,17 @@ sub close_edit {
 						$active_branch_path = $1;
 					}
 
-					# Standardize the absolute folder server URL context path string sequences
 					my $current_folder_url = $repo_root_url . "/" . $current_svn_dir;
 					$current_folder_url =~ s/\/$//;
 
 					if ($debug_active) {
-						print STDERR "\nDEBUG: Processing SVN folder: '$current_svn_dir' -> Git path equivalent: '$gpath'\n";
+						print STDERR "\nDEBUG: Processing SVN folder: '$current_svn_dir' -> Git path: '$gpath'\n";
 						print STDERR "DEBUG: Identified Active Branch Context Prefix = '$active_branch_path'\n";
-						print STDERR "DEBUG: Folder absolute SVN URL context = '$current_folder_url'\n";
 					}
 
 					foreach my $line (split(/\r?\n/, $ext->{value})) {
 						next if $line =~ /^\s*$/ || $line =~ /^\s*#/;
 						$line =~ s/^\s+|\s+$//g;
-						
-						if ($debug_active) {
-							print STDERR "--------------------------------------------------\n";
-							print STDERR "DEBUG: Raw external entry line: '$line'\n";
-						}
 						
 						if ($line =~ /^(.*?)\s+([^\s]+)$/) {
 							my $ext_raw_url = $1;
@@ -502,7 +494,6 @@ sub close_edit {
 							
 							my $resolved_abs_url = '';
 
-							# 3. EXPAND RAW STRINGS TO ABSOLUTE PATH STRINGS
 							if ($ext_raw_url =~ /^\^\/(.*)/) {
 								$resolved_abs_url = $repo_root_url . "/" . $1;
 							} elsif ($ext_raw_url =~ m{^(https?://|file://)}) {
@@ -520,11 +511,9 @@ sub close_edit {
 							
 							$resolved_abs_url =~ s/\/$//;
 
-							# 4. RESOLVE PURE INTRINSIC SERVER ROOT SNIPPET PATHS
 							if ($resolved_abs_url =~ m{^\Q$repo_root_url\E/(.*)}) {
-								my $target_inner_svn_path = $1; # e.g., "trunk/Media" or "branches/name/Media"
+								my $target_inner_svn_path = $1;
 								
-								# Extract target destination branch context prefix properties
 								my $target_branch_path = '';
 								if ($target_inner_svn_path =~ m{^(trunk|somefolder)(?:/|$)}) {
 									$target_branch_path = $1;
@@ -533,37 +522,48 @@ sub close_edit {
 								}
 
 								if ($debug_active) {
-									print STDERR "DEBUG: Checking internal branch match metrics:\n";
-									print STDERR "       Current context path branch = '$active_branch_path'\n";
-									print STDERR "       Target definition path branch = '$target_branch_path'\n";
+									print STDERR "DEBUG: Checking match boundaries: Context='$active_branch_path', Target='$target_branch_path'\n";
 								}
 
-								# 5. CORE VALIDATION: Verify external stays inside current branch context boundaries
-								if ($active_branch_path ne '' && $active_branch_path eq $target_branch_path) {
+								# Enforce branch limits: They must match if a boundary prefix is present
+								if ($active_branch_path eq $target_branch_path) {
 									
-									# Isolate target subpath details relative to the branch root folder area
+									# Calculate the actual destination path as it will look inside the Git workspace
 									my $internal_git_source_path = $target_inner_svn_path;
-									$internal_git_source_path =~ s/^\Q$active_branch_path\E\///; # e.g., "Media"
+									
+									# If using --stdlayout, strip the prefix folder name (e.g. 'trunk/')
+									if ($gpath !~ m{^\Q$active_branch_path\E(?:/|$)}) {
+										$internal_git_source_path =~ s/^\Q$active_branch_path\E\///;
+									}
 
 									my $link_placement = $gpath ? "$gpath/$local_target_dir" : $local_target_dir;
 									
-									# 6. UNIFORM RELATIVE PATH PREFIX GENERATOR
-									my $current_depth = 0;
-									if ($gpath && $gpath ne '') {
-										my @directories = split(/\//, $gpath);
-										$current_depth = scalar @directories;
+									# ==========================================================================
+									# MATHEMATICAL PATH-DIFFERENCE TRAVERSAL ENGINE
+									# ==========================================================================
+									# Break both the source folder path and target destination path into arrays
+									my @src_parts = split(/\//, $gpath);
+									my @dst_parts = split(/\//, $internal_git_source_path);
+									
+									# Strip out matching leading elements that they share in common
+									while (@src_parts && @dst_parts && $src_parts[0] eq $dst_parts[0]) {
+										shift @src_parts;
+										shift @dst_parts;
 									}
 									
-									my $relative_prefix = $current_depth > 0 ? ("../" x $current_depth) : "./";
-									my $symlink_target_content = $relative_prefix . $internal_git_source_path;
+									# The remaining elements in @src_parts dictate the exact number of '../' hops needed
+									my $relative_prefix = @src_parts > 0 ? ("../" x scalar(@src_parts)) : "./";
 									
+									# Append the remaining destination path to form the target
+									my $symlink_target_content = $relative_prefix . join('/', @dst_parts);
+									# ==========================================================================
+
 									if ($debug_active) {
-										print STDERR "DEBUG: MATCH SUCCESS! Inner branch path target = '$internal_git_source_path'\n";
-										print STDERR "DEBUG: Final calculated relative target string = '$symlink_target_content'\n";
-										print STDERR "DEBUG: Committing reference tree mapping      = '$link_placement' -> '$symlink_target_content'\n";
+										print STDERR "DEBUG: MATCH SUCCESS!\n";
+										print STDERR "DEBUG: Formatted relative target value  = '$symlink_target_content'\n";
+										print STDERR "DEBUG: Registering node mapping tree    = '$link_placement' -> '$symlink_target_content'\n";
 									}
 
-									# 7. Stage and materialize link object data natively
 									my ($ho_out, $ho_in);
 									my $ho_pid = open2($ho_out, $ho_in, 'git', 'hash-object', '-w', '--stdin');
 									print $ho_in $symlink_target_content;
@@ -577,15 +577,15 @@ sub close_edit {
 										$self->{gii}->update("120000", $link_sha, $link_placement);
 										delete $self->{empty}->{$current_svn_dir} if exists $self->{empty}->{$current_svn_dir};
 										
-										if ($debug_active) {
-											system('git', 'checkout-index', '-f', $link_placement);
+										if (!$debug_active) {
+											`git checkout-index -f "$link_placement" 2>/dev/null`;
 										} else {
-											system('git', 'checkout-index', '-f', $link_placement, '2>/dev/null');
+											system('git', 'checkout-index', '-f', $link_placement);
 										}
 										print STDOUT "\tNatively committed directory link: $link_placement -> $symlink_target_content\n" unless $::_q;
 									}
 								} else {
-									if ($debug_active) { print STDERR "DEBUG: MATCH FAILED! External path targets an out-of-branch location.\n"; }
+									if ($debug_active) { print STDERR "DEBUG: MATCH FAILED! External escapes active branch.\n"; }
 									print STDOUT "\tSkipping external: $ext_raw_url (Points outside active branch context)\n" unless $::_q;
 								}
 							}
